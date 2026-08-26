@@ -49,6 +49,36 @@ _UNATTRIBUTED_TRACKABLE_CALL_TYPES: Final[frozenset[str]] = frozenset(
 )
 
 
+async def _request_started_before_key_spend_reset(
+    user_api_key: str | None,
+    start_time: Any,
+) -> bool:
+    """Whether this completion belongs to the key's pre-reset spend window.
+
+    Reset Spend updates the persistent key value and its spend counter, but
+    requests already in flight can complete afterwards. Ignore their key-level
+    aggregate update while preserving their immutable SpendLog record.
+    """
+    if not isinstance(user_api_key, str) or not isinstance(start_time, datetime):
+        return False
+
+    try:
+        request_started_at = start_time.timestamp()
+        from litellm.proxy.proxy_server import spend_counter_cache
+
+        reset_at = await spend_counter_cache.async_get_cache(
+            key=f"spend_reset_at:key:{user_api_key}",
+        )
+        return reset_at is not None and request_started_at < float(reset_at)
+    except Exception:
+        verbose_proxy_logger.debug(
+            "Unable to read key spend reset marker for %s",
+            user_api_key,
+            exc_info=True,
+        )
+        return False
+
+
 class _ProxyDBLogger(CustomLogger):
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         await self._PROXY_track_cost_callback(kwargs, response_obj, start_time, end_time)
@@ -505,9 +535,23 @@ async def _update_database_and_spend_counters(
     budget_reservation: dict | None,
     request_tags: list[str] | None = None,
 ) -> None:
+    token_for_aggregate_spend = user_api_key
+    reservation_for_aggregate_spend = budget_reservation
+    if await _request_started_before_key_spend_reset(
+        user_api_key=user_api_key,
+        start_time=start_time,
+    ):
+        verbose_proxy_logger.info(
+            "Ignoring pre-reset in-flight spend for key %s; raw SpendLog is retained",
+            user_api_key,
+        )
+        await _release_budget_reservation(budget_reservation=budget_reservation)
+        token_for_aggregate_spend = None
+        reservation_for_aggregate_spend = None
+
     try:
         await proxy_logging_obj.db_spend_update_writer.update_database(
-            token=user_api_key,
+            token=token_for_aggregate_spend,
             response_cost=response_cost,
             user_id=user_id,
             end_user_id=end_user_id,
@@ -534,12 +578,12 @@ async def _update_database_and_spend_counters(
 
     try:
         await increment_spend_counters(
-            token=user_api_key,
+            token=token_for_aggregate_spend,
             team_id=team_id,
             user_id=user_id,
             response_cost=response_cost,
             org_id=org_id,
-            budget_reservation=budget_reservation,
+            budget_reservation=reservation_for_aggregate_spend,
             end_user_id=end_user_id,
             tags=request_tags,
         )

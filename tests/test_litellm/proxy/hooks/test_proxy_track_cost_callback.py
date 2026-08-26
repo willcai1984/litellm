@@ -475,6 +475,60 @@ async def test_update_database_and_spend_counters_updates_counters_after_db_upda
 
 
 @pytest.mark.asyncio
+async def test_update_database_and_spend_counters_ignores_pre_reset_key_aggregate_spend():
+    """A request started before Reset Spend must not restore the old key balance."""
+    proxy_logging_obj = MagicMock()
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()
+    increment_spend_counters = AsyncMock()
+    budget_reservation = {"reserved_cost": 0.5, "entries": []}
+
+    with (
+        patch(
+            "litellm.proxy.hooks.proxy_track_cost_callback._request_started_before_key_spend_reset",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "litellm.proxy.spend_tracking.budget_reservation.release_budget_reservation",
+            new_callable=AsyncMock,
+        ) as mock_release_budget_reservation,
+    ):
+        await _update_database_and_spend_counters(
+            proxy_logging_obj=proxy_logging_obj,
+            increment_spend_counters=increment_spend_counters,
+            user_api_key="test_api_key",
+            user_id="test_user_id",
+            end_user_id="test_end_user_id",
+            team_id="test_team_id",
+            org_id="test_org_id",
+            kwargs={},
+            completion_response=None,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            response_cost=0.2,
+            budget_reservation=budget_reservation,
+        )
+
+    # update_database still receives the request and emits its immutable
+    # SpendLog, but token=None prevents this pre-reset request from changing
+    # the key's aggregate spend.
+    assert proxy_logging_obj.db_spend_update_writer.update_database.await_args.kwargs["token"] is None
+    increment_spend_counters.assert_awaited_once_with(
+        token=None,
+        team_id="test_team_id",
+        user_id="test_user_id",
+        response_cost=0.2,
+        org_id="test_org_id",
+        budget_reservation=None,
+        end_user_id="test_end_user_id",
+        tags=None,
+    )
+    mock_release_budget_reservation.assert_awaited_once_with(
+        budget_reservation=budget_reservation,
+    )
+
+
+@pytest.mark.asyncio
 async def test_update_database_and_spend_counters_invalidates_reservation_when_counter_update_fails():
     proxy_logging_obj = MagicMock()
     proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()

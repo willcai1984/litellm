@@ -5077,6 +5077,32 @@ async def reset_key_spend_fn(
                     redis_err,
                 )
 
+        # A reset is a new accounting window. Requests that began before this
+        # point can finish after the reset; their cost callback must not add
+        # the old window's spend back onto this key. The callback retains the
+        # raw SpendLog for auditability, but skips this key's aggregate spend.
+        # Keep the marker longer than the proxy's 180s request timeout.
+        _reset_marker_key: Final = f"spend_reset_at:key:{hashed_api_key}"
+        _reset_marker_value: Final = datetime.now(timezone.utc).timestamp()
+        spend_counter_cache.in_memory_cache.set_cache(
+            key=_reset_marker_key,
+            value=_reset_marker_value,
+            ttl=300,
+        )
+        if spend_counter_cache.redis_cache is not None:
+            try:
+                await spend_counter_cache.redis_cache.async_set_cache(
+                    key=_reset_marker_key,
+                    value=_reset_marker_value,
+                    ttl=300,
+                )
+            except Exception as redis_err:
+                verbose_proxy_logger.warning(
+                    "Failed to set reset marker %s in Redis: %s. In-flight requests may restore pre-reset key spend.",
+                    _reset_marker_key,
+                    redis_err,
+                )
+
         max_budget: Final = updated_key.max_budget
         budget_reset_at: Final = updated_key.budget_reset_at
 
